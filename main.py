@@ -1,14 +1,13 @@
 import os
-import httpx
-import speech_recognition as sr
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security.api_key import APIKeyHeader
+from playwright.sync_api import sync_playwright
+import speech_recognition as sr
 from pydub import AudioSegment
+import httpx
 
 app = FastAPI()
-
-# Replace with your own secure key
-API_KEY = "YOUR_SECRET_KEY" 
+API_KEY = "consulsofnato"
 api_key_header = APIKeyHeader(name="access_token", auto_error=False)
 
 def verify_key(key: str = Depends(api_key_header)):
@@ -16,41 +15,52 @@ def verify_key(key: str = Depends(api_key_header)):
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return key
 
-@app.post("/solve")
-async def solve_captcha(audio_url: str, key: str = Depends(verify_key)):
-    mp3_path = "temp.mp3"
-    wav_path = "temp.wav"
-    
-    try:
-        # 1. Download the audio file
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(audio_url)
-            if resp.status_code != 200:
-                return {"status": "error", "message": "Failed to download audio."}
-            with open(mp3_path, "wb") as f:
-                f.write(resp.content)
-
-        # 2. Convert MP3 to WAV
-        audio = AudioSegment.from_mp3(mp3_path)
-        audio.export(wav_path, format="wav")
-
-        # 3. Process with Speech Recognition
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
-            # Google's free speech-to-text API
-            result = recognizer.recognize_google(audio_data)
+@app.post("/solve_on_page")
+def solve_on_page(target_url: str, key: str = Depends(verify_key)):
+    with sync_playwright() as p:
+        # Launching with specific flags to save RAM
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage", "--no-sandbox"])
+        context = browser.new_context()
+        page = context.new_page()
+        
+        try:
+            page.goto(target_url)
             
-        return {"status": "success", "code": result}
+            # 1. Handle reCAPTCHA Checkbox
+            captcha_frame = page.frame_locator("iframe[title*='reCAPTCHA']")
+            captcha_frame.locator(".recaptcha-checkbox-border").click()
+            page.wait_for_timeout(2000)
 
-    except sr.UnknownValueError:
-        return {"status": "error", "message": "Could not understand the audio."}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    
-    finally:
-        # 4. Cleanup temp files so Render doesn't run out of disk space
-        if os.path.exists(mp3_path):
-            os.remove(mp3_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
+            # 2. Switch to Audio Challenge
+            challenge_frame = page.frame_locator("iframe[title*='recaptcha challenge']")
+            challenge_frame.locator("#recaptcha-audio-button").click()
+            page.wait_for_timeout(2000)
+
+            # 3. Get Audio URL & Solve
+            audio_url = challenge_frame.locator("#audio-source").get_attribute("src")
+            
+            # Download & Process Audio
+            with httpx.Client() as client:
+                resp = client.get(audio_url)
+                with open("temp.mp3", "wb") as f:
+                    f.write(resp.content)
+            
+            AudioSegment.from_mp3("temp.mp3").export("temp.wav", format="wav")
+            
+            recognizer = sr.Recognizer()
+            with sr.AudioFile("temp.wav") as source:
+                audio_data = recognizer.record(source)
+                solution = recognizer.recognize_google(audio_data)
+
+            # 4. Input Solution
+            challenge_frame.locator("#audio-response").fill(solution)
+            challenge_frame.locator("#recaptcha-verify-button").click()
+            page.wait_for_timeout(1000)
+
+            return {"status": "success", "solution": solution}
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+        finally:
+            browser.close()
+            
